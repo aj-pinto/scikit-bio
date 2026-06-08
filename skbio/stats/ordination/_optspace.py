@@ -73,7 +73,24 @@ def _svd_sort(U, S, V):
     return U, S, V
 
 
-def _compute_gradient(M, E, U, V, n, m, observed_mask):
+def estimate_rank(S, epsilon):
+    # Estimate rank r\hat by minimizing the cost function of singular
+    # values from Keshavan et al. (2010)
+
+    # Indices i = 1, 2, ... , len(S) - 1
+    # The last element is excluded because S[i] would be out of bounds
+    i = np.arange(1, len(S))  # 1 , ... , k-1
+    cost = (S[0] * np.sqrt(i / epsilon) + S[i]) / S[i - 1]
+    # print(f"Index {i}") # Delete
+    # print(f"S[i]: {S[i]}")
+    # print(f"S[i - 1]: {S[i - 1]}")
+    # print(f"epsilon: {epsilon}")
+    # print(f"Cost: {cost}") # Delete
+
+    return i[np.argmin(cost)]
+
+
+def _compute_gradient(E, U, V, S, observed_mask):
     """Compute gradient for OptSpace optimization.
 
     Parameters
@@ -102,10 +119,109 @@ def _compute_gradient(M, E, U, V, n, m, observed_mask):
     E_masked = E * observed_mask
 
     # Compute gradients
-    grad_U = E_masked.dot(V) / n
-    grad_V = E_masked.T.dot(U) / m
+    grad_U = E_masked.dot(V).dot(S.T)
+    grad_V = E_masked.T.dot(U).dot(S)
 
     return grad_U, grad_V
+
+
+####
+
+# def _sym(A):
+#     return 0.5 * (A + A.T)
+#
+#
+# def _euclidean_grad(U, V, S, M_obs, Omega):
+#     M = U @ S @ V.T
+#     R = Omega * (M - M_obs)
+#     R = np.nan_to_num(R, nan=0.0)
+#
+#     grad_U = R @ V @ S.T
+#     grad_V = R.T @ U @ S
+#
+#     return R, grad_U, grad_V
+#
+#
+# def _riemannian_grad(U, V, grad_U, grad_V):
+#     # Stiefel projections
+#     grad_U = grad_U - U @ _sym(U.T @ grad_U)
+#     grad_V = grad_V - V @ _sym(V.T @ grad_V)
+#     return grad_U, grad_V
+#
+#
+# def _newton_direction(U, V, grad_U, grad_V, damping=1e-3):
+#     """
+#     Gauss-Newton style preconditioned step.
+#     """
+#     # simple curvature-aware scaling (cheap Hessian approximation)
+#     H_U = np.linalg.norm(U, axis=0, keepdims=True).T + damping
+#     H_V = np.linalg.norm(V, axis=0, keepdims=True).T + damping
+#
+#     dU = -grad_U / H_U.T
+#     dV = -grad_V / H_V.T
+#
+#     return dU, dV
+#
+#
+# def _retract_qr(X):
+#     Q, _ = np.linalg.qr(X)
+#     return Q
+#
+#
+# def _compute_S(U, V, M_obs, Omega):
+#     # same idea as OptSpace: least squares over observed entries
+#     return _compute_singular_values(U, V, M_obs, Omega)
+#
+#
+# def _objective(U, V, S, M_obs, Omega):
+#     M = U @ S @ V.T
+#     R = Omega * (M - M_obs)
+#     R = np.nan_to_num(R, nan=0.0)
+#     return 0.5 * np.sum(R * R)
+#
+#
+# def _line_search(
+#     U,
+#     V,
+#     S,
+#     M_obs,
+#     Omega,
+#     step_size=1.0,
+#     max_iter=20,
+#     tol=1e-6,
+# ):
+#     current_obj = _objective(U, V, S, M_obs, Omega)
+#
+#     for _ in range(max_iter):
+#
+#         # --- gradients ---
+#         R, gU, gV = _euclidean_grad(U, V, S, M_obs, Omega)
+#         gU, gV = _riemannian_grad(U, V, gU, gV)
+#
+#         # --- Newton direction (Gauss-Newton approx) ---
+#         dU, dV = _newton_direction(U, V, gU, gV)
+#
+#         # --- trial step ---
+#         U_new = _retract_qr(U + step_size * dU)
+#         V_new = _retract_qr(V + step_size * dV)
+#
+#         # --- re-solve S exactly (block minimization) ---
+#         S_new = _compute_S(U_new, V_new, M_obs, Omega)
+#
+#         new_obj = _objective(U_new, V_new, S_new, M_obs, Omega)
+#
+#         # --- Armijo-like acceptance ---
+#         if new_obj < current_obj:
+#             return U_new, V_new, S_new, step_size
+#
+#         step_size *= 0.5
+#
+#         if step_size < tol:
+#             break
+#
+#     return U, V, S, step_size
+
+####
 
 
 def _line_search(
@@ -116,8 +232,8 @@ def _line_search(
     grad_V,
     M_observed,
     observed_mask,
-    n,
     m,
+    n,
     step_size=1.0,
     max_iter=50,
     tol=1e-6,
@@ -204,7 +320,43 @@ def _compute_singular_values(U, V, M_observed, observed_mask):
     ndarray
         Optimal diagonal singular value matrix (r x r).
     """
+
     r = U.shape[1]
+
+    rows, cols = np.where(observed_mask)
+
+    A = np.einsum("ni,nj->nij", U[rows], V[cols]).reshape(len(rows), -1)
+
+    b = M_observed[rows, cols]
+
+    s = np.linalg.lstsq(A, b, rcond=None)[0]
+
+    S = s.reshape(r, r)
+
+    return S
+
+    """
+    This approach solves for a diagonal S via the reduced rxr system. However,
+    unless the basis vectors of U and V align with the singular vectors of the
+    observed matrix, S will not in general be diagonal, and the true singular
+    values will instead be mixed across the entire matrix. So, we solve for this
+    full S.
+
+    G = np.zeros((r, r))
+    c = np.zeros(r)
+
+    rows, cols = np.where(observed_mask)
+
+    A = U[rows] * V[cols]
+    b = M_observed[rows, cols]
+
+    G = A.T @ A
+    c = A.T @ b
+
+    s = np.linalg.lstsq(G, c, rcond=None)[0]
+    """
+
+    """
 
     # Build and solve the linear system for S
     # For each observed entry (i,j): M[i,j] = sum_k U[i,k] * S[k,k] * V[j,k]
@@ -232,8 +384,28 @@ def _compute_singular_values(U, V, M_observed, observed_mask):
 
             if np.sum(a_obs**2) > 1e-10:
                 S[k, k] = np.dot(a_obs, b_obs) / np.dot(a_obs, a_obs)
+    """
 
-    return S
+    return np.diag(s)
+
+
+def trim(X, observed_mask, m, n, n_observed):
+    """Trim over-represented rows and columns.
+
+    (More than half the average observed entries)"""
+
+    n_observed_rows = np.sum(observed_mask, axis=1)
+    n_observed_cols = np.sum(observed_mask, axis=0)
+
+    row_threshold = 2 * n_observed / m
+    col_threshold = 2 * n_observed / n
+
+    valid_rows = n_observed_rows <= row_threshold
+    valid_cols = n_observed_cols <= col_threshold
+
+    trim_mask = np.outer(valid_rows, valid_cols)
+
+    return np.where(trim_mask & observed_mask, X, 0.0)
 
 
 class OptSpace:
@@ -333,35 +505,57 @@ class OptSpace:
         if X.ndim != 2:
             raise ValueError(f"Input must be 2D, got {X.ndim}D array.")
 
-        n, m = X.shape
+        m, n = X.shape
         r = self.n_components
 
-        if r > min(n, m):
+        if r > min(m, n):
             raise ValueError(
-                f"n_components ({r}) cannot exceed min matrix dimension ({min(n, m)})."
+                f"n_components ({r}) cannot exceed min matrix dimension ({min(m, n)})."
             )
 
         # Create observed mask (1 for observed, 0 for missing)
         observed_mask = ~np.isnan(X)
-        observed_mask = observed_mask.astype(np.float64)
+        n_observed = np.sum(observed_mask)
 
-        # Replace NaN with 0 for computation
-        X_filled = np.nan_to_num(X, nan=0.0)
+        # Trim over-represented rows and columns
+        X_trimmed = trim(X, observed_mask, m, n, n_observed)
 
         # Compute sparsity for rescaling
-        n_observed = np.sum(observed_mask)
         sparsity = n_observed / (n * m)
+        epsilon = n_observed / np.sqrt(m * n)
 
         # Rescale observed values for sparse initialization
-        X_scaled = X_filled / max(sparsity, 1e-10)
+        X_trimmed *= sparsity  # max(sparsity, 1e-10)
+
+        """
+        # Estimate rank
+        U, s, Vt = svd(X_trimmed, full_matrices=False)
+        #U, s, Vt = svds(X_trimmed, k=min(m, n) * 0.2)
+        V = Vt.T
+        U, s, V = _svd_sort(U, s, V)
+        print(s) # Delete
+
+        rhat = estimate_rank(s, epsilon)
+
+        #print(f"Estimated rank: {rhat}") # Delete
+        #print(f"Size of U and V: {U.shape}, {V.shape}, s: {s.shape}") # Delete
+
+        # Compute the rank-rhat projection of the trimmed matrix
+        U = U[:, :rhat]
+        s = s[:rhat]
+        V = V[:, :rhat]
+
+        #print(f"Estimated rank: {rhat}") # Delete
+        #print(f"Size of U and V: {U.shape}, {V.shape}, s: {s.shape}") # Delete
+        """
 
         # Initialize with truncated SVD
         try:
             if r < min(n, m) - 1:
-                U, s, Vt = svds(X_scaled, k=r)
+                U, s, Vt = svds(X_trimmed, k=r)
                 V = Vt.T
             else:
-                U, s, Vt = svd(X_scaled, full_matrices=False)
+                U, s, Vt = svd(X_trimmed, full_matrices=False)
                 U = U[:, :r]
                 s = s[:r]
                 V = Vt[:r, :].T
@@ -373,11 +567,9 @@ class OptSpace:
             V, _ = np.linalg.qr(V)
             s = np.ones(r)
 
-        # Sort by singular values
-        U, s, V = _svd_sort(U, s, V)
-
         # Initialize S as diagonal matrix
-        S = np.diag(s) * sparsity  # Scale back
+        # S = np.diag(s) / sparsity  # Scale back
+        S = _compute_singular_values(U, V, X, observed_mask)
 
         # Optimization loop
         step_size = 1.0
@@ -386,7 +578,7 @@ class OptSpace:
         for iteration in range(self.max_iterations):
             # Compute current reconstruction and error
             M = U.dot(S).dot(V.T)
-            E = (X - M) * observed_mask
+            E = (M - X) * observed_mask
             E = np.nan_to_num(E, nan=0.0)
 
             # Current objective (Frobenius norm of error)
@@ -395,17 +587,25 @@ class OptSpace:
             # Check convergence
             if abs(prev_obj - obj) < self.tol:
                 self.converged = True
+                print(
+                    f"Converged at iteration {iteration}, objective: {obj:.6f}"
+                )  # Delete
                 break
 
             prev_obj = obj
 
             # Compute gradients
-            grad_U, grad_V = _compute_gradient(M, E, U, V, n, m, observed_mask)
+            grad_U, grad_V = _compute_gradient(E, U, V, S, observed_mask)
 
             # Update with line search
             U, V, S, step_size = _line_search(
-                U, V, S, grad_U, grad_V, X, observed_mask, n, m, step_size=step_size
+                U, V, S, grad_U, grad_V, X, observed_mask, m, n, step_size=step_size
             )
+
+            # # Update with line search
+            # U, V, S, step_size = _line_search(
+            #     U, V, S, X, observed_mask, step_size=step_size
+            # )
 
         # Recompute final S
         S = _compute_singular_values(U, V, X, observed_mask)
