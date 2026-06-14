@@ -36,6 +36,8 @@ References
 import numpy as np
 from scipy.sparse.linalg import svds
 from scipy.linalg import svd
+from scipy.sparse.linalg import LinearOperator
+from scipy.sparse.linalg import cg
 
 
 def _svd_sort(U, S, V):
@@ -389,6 +391,153 @@ def _compute_singular_values(U, V, M_observed, observed_mask):
     return np.diag(s)
 
 
+###
+
+
+def jacobian_action(U, V, S, dU, dV, observed_mask):
+    """Compute J(dU, dV)."""
+
+    W = dU @ S @ V.T
+    W += U @ S @ dV.T
+
+    return W * observed_mask
+
+
+def jacobian_adjoint(U, V, S, W):
+    """Compute J*(W)."""
+
+    dU = W @ V @ S.T
+    dV = W.T @ U @ S
+
+    dU -= U @ (U.T @ dU)
+    dV -= V @ (V.T @ dV)
+
+    return dU, dV
+
+
+def gauss_newton_hvp(
+    U,
+    V,
+    S,
+    dU,
+    dV,
+    observed_mask,
+    damping=0.0,
+):
+    """Apply (J*J + λI) to a tangent vector."""
+
+    W = jacobian_action(U, V, S, dU, dV, observed_mask)
+    Hu, Hv = jacobian_adjoint(U, V, S, W)
+
+    # if damping:
+    #     r = S.shape[0]
+    #
+    #     # scale by geometry + dimension
+    #     lambda_scale = damping * (observed_mask.sum() / (U.shape[0] * U.shape[1]))
+    #
+    #     lambda_U = lambda_scale * (np.trace(V.T @ V) / r)
+    #     lambda_V = lambda_scale * (np.trace(U.T @ U) / r)
+    #
+    #     Hu += lambda_U * dU
+    #     Hv += lambda_V * dV
+
+    # if damping:
+    #     Hu += damping * dU
+    #     Hv += damping * dV
+
+    return Hu, Hv
+
+
+def gauss_newton_rhs(
+    U,
+    V,
+    S,
+    M_observed,
+    observed_mask,
+):
+    """Compute -J*(R)."""
+
+    R = U @ S @ V.T - M_observed
+    R = np.nan_to_num(R, nan=0.0)
+
+    gU, gV = jacobian_adjoint(U, V, S, R)
+
+    return -gU, -gV
+
+
+def pack(dU, dV):
+    return np.concatenate([dU.ravel(), dV.ravel()])
+
+
+def unpack(x, U_shape, V_shape):
+    nu = np.prod(U_shape)
+
+    dU = x[:nu].reshape(U_shape)
+    dV = x[nu:].reshape(V_shape)
+
+    return dU, dV
+
+
+def solve_gauss_newton_step(
+    U,
+    V,
+    S,
+    M_observed,
+    observed_mask,
+    damping=1e-1,
+):
+    """Solve (J*J+λI)η=-J*R."""
+
+    bU, bV = gauss_newton_rhs(U, V, S, M_observed, observed_mask)
+
+    b = pack(bU, bV)
+
+    nvars = b.size
+
+    def matvec(x):
+        dU, dV = unpack(x, U.shape, V.shape)
+
+        Hu, Hv = gauss_newton_hvp(
+            U,
+            V,
+            S,
+            dU,
+            dV,
+            observed_mask,
+            damping=damping,
+        )
+
+        return pack(Hu, Hv)
+
+    A = LinearOperator(
+        (nvars, nvars),
+        matvec=matvec,
+        dtype=U.dtype,
+    )
+
+    step, info = cg(
+        A,
+        b,
+        rtol=1e-6,
+        maxiter=50,
+    )
+
+    dU, dV = unpack(step, U.shape, V.shape)
+
+    # dU -= U @ (U.T @ dU)
+    # dV -= V @ (V.T @ dV)
+
+    return dU, dV
+
+
+def retract_grassmann(X, dX):
+    Q, _ = np.linalg.qr(X + dX)
+    return Q[:, : X.shape[1]]
+
+
+###
+
+
 def trim(X, observed_mask, m, n, n_observed):
     """Trim over-represented rows and columns.
 
@@ -571,6 +720,46 @@ class OptSpace:
         # S = np.diag(s) / sparsity  # Scale back
         S = _compute_singular_values(U, V, X, observed_mask)
 
+        ###
+
+        prev_obj = np.inf
+
+        for iteration in range(self.max_iterations):
+            # Compute current reconstruction and error
+            M = U.dot(S).dot(V.T)
+            E = (M - X) * observed_mask
+            E = np.nan_to_num(E, nan=0.0)
+
+            # Current objective (Frobenius norm of error)
+            obj = np.sum(E**2)
+            print(f"Iteration {iteration}, objective: {obj:.6f}")  # Delete
+
+            # Check convergence
+            if abs(prev_obj - obj) < self.tol:
+                self.converged = True
+                """print(
+                    f"Converged at iteration {iteration}, objective: {obj:.6f}"
+                )  # Delete"""
+                break
+
+            prev_obj = obj
+
+            ###
+
+            noise_var = obj / n_observed
+
+            ###
+
+            dU, dV = solve_gauss_newton_step(U, V, S, X, observed_mask)
+
+            U = retract_grassmann(U, dU)
+            V = retract_grassmann(V, dV)
+
+            S = _compute_singular_values(U, V, X, observed_mask)
+
+        ###
+
+        """
         # Optimization loop
         step_size = 1.0
         prev_obj = np.inf
@@ -609,6 +798,7 @@ class OptSpace:
 
         # Recompute final S
         S = _compute_singular_values(U, V, X, observed_mask)
+        """
 
         # Final sort
         s_diag = np.diag(S)
