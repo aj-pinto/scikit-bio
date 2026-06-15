@@ -43,7 +43,9 @@ from scipy.sparse.linalg import cg
 def trim(X, observed_mask, m, n, n_observed):
     """Trim over-represented rows and columns.
 
-    (More than half the average observed entries)"""
+    Any row or column with more than half the average observed entries per
+    row or column respectively is set to zero per Keshavan et al. (2010).
+    This makes the low-rank structure more pronounced.)"""
 
     n_observed_rows = np.sum(observed_mask, axis=1)
     n_observed_cols = np.sum(observed_mask, axis=0)
@@ -96,7 +98,7 @@ def _svd_sort(U, S, V):
 
 def estimate_rank(S, epsilon):
     """Estimate rank r\\hat by minimizing the cost function of singular
-    values from Keshavan et al. (2010)
+    values from Keshavan et al. (2010).
     """
 
     # Indices i = 1, 2, ... , len(S) - 1
@@ -112,26 +114,19 @@ def estimate_rank(S, epsilon):
     return i[np.argmin(cost)]
 
 
-def _compute_singular_values(U, V, M_observed, observed_mask):
-    """Compute optimal singular values given U and V.
+def solve_S(U, V, M_observed, observed_mask):
+    """Compute optimal S given U and V.
 
-    Solves the least squares problem to find optimal S.
+    Solves the least squares problem to find the optimal S
+    that minimizes reconstruction difference on the observed entries:
 
-    Parameters
-    ----------
-    U : ndarray
-        Left singular vectors (n x r).
-    V : ndarray
-        Right singular vectors (m x r).
-    M_observed : ndarray
-        Observed matrix values.
-    observed_mask : ndarray
-        Binary mask for observed entries.
+    arg min_S ||P_\\Omega(U V S^T - M_observed)||_F^2
 
-    Returns
-    -------
-    ndarray
-        Optimal diagonal singular value matrix (r x r).
+    where P_\\Omega is the projection onto the observed entries.
+    Since only the observed entries are considered, the problem
+    can be vectorized and solved efficiently using least squares:
+
+    arg min_S \\sum_{(i,j) \\in \\Omega} (U[i] S V[j]^T - M_observed[i, j])^2
     """
 
     r = U.shape[1]
@@ -399,7 +394,7 @@ class OptSpace:
 
         # Initialize S as diagonal matrix
         # S = np.diag(s) / sparsity  # Scale back
-        S = _compute_singular_values(U, V, X, observed_mask)
+        S = solve_S(U, V, X, observed_mask)
 
         ###
 
@@ -431,7 +426,7 @@ class OptSpace:
             U = retract_grassmann(U, dU)
             V = retract_grassmann(V, dV)
 
-            S = _compute_singular_values(U, V, X, observed_mask)
+            S = solve_S(U, V, X, observed_mask)
 
         # Final sort
         s_diag = np.diag(S)
