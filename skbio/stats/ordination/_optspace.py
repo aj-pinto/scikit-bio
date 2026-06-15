@@ -146,6 +146,24 @@ def solve_S(U, V, M_observed, observed_mask):
     return S
 
 
+def residual(U, V, S, M_obs):
+    """Compute the residual R = P_Ω(USV^T - M_obs)."""
+    R = U @ S @ V.T - M_obs
+    R = np.nan_to_num(R, nan=0.0)
+
+    return R
+
+    # (U_i S V_j^T) evaluated only on observed entries
+    rows, cols = np.where(observed_mask)
+    Ui = U[rows]  # (n_obs, r)
+    Vj = V[cols]  # (n_obs, r)
+
+    R = np.einsum("ir,rs,is->i", Ui, S, Vj)  # (n_obs,)
+    R -= M_obs[rows, cols]  # (n_obs,)
+
+    return R
+
+
 def jacobian_action(U, V, S, dU, dV, observed_mask):
     """Compute J(dU, dV)."""
 
@@ -200,12 +218,17 @@ def unpack(x, U_shape, V_shape):
     return dU, dV
 
 
-def solve_gauss_newton_step(U, V, S, M_observed, observed_mask, damping=1e-1):
-    """Solve (J*J+λI)η=-J*R."""
+def solve_gauss_newton_step(U, V, S, M_observed, observed_mask, R, damping=1e-1):
+    """Solve (J*J+λI)η=-J*R.
 
-    bU, bV = gauss_newton_rhs(U, V, S, M_observed, observed_mask)
+    The Gauss-Newton step η = (dU, dV) is computed by solving the linear system
+    using Conjugate Gradient."""
 
-    b = pack(bU, bV)
+    # bU, bV = gauss_newton_rhs(U, V, S, M_observed, observed_mask)
+
+    bU, bV = jacobian_adjoint(U, V, S, R)
+
+    b = pack(-bU, -bV)
 
     nvars = b.size
 
@@ -229,6 +252,7 @@ def solve_gauss_newton_step(U, V, S, M_observed, observed_mask, damping=1e-1):
 
 
 def retract_grassmann(X, dX):
+    """Retract the updated matrix X + dX back to the Grassmann manifold."""
     Q, _ = np.linalg.qr(X + dX)
     return Q[:, : X.shape[1]]
 
@@ -401,15 +425,14 @@ class OptSpace:
         prev_obj = np.inf
 
         for iteration in range(self.max_iterations):
+            S = solve_S(U, V, X, observed_mask)
+
             # Compute current reconstruction and error
-            M = U.dot(S).dot(V.T)
-            E = M - X
-            E = (M - X) * observed_mask
-            E = np.nan_to_num(E, nan=0.0)
+            R = residual(U, V, S, X)
 
             # Current objective (Frobenius norm of error)
-            obj = np.sum(E**2)
-            print(f"Iteration {iteration}, objective: {obj:.6f}")  # Delete
+            obj = np.sum(R**2)
+            # print(f"Iteration {iteration}, objective: {obj:.6f}")  # Delete
 
             # Check convergence
             if abs(prev_obj - obj) < self.tol:
@@ -421,7 +444,7 @@ class OptSpace:
 
             prev_obj = obj
 
-            dU, dV = solve_gauss_newton_step(U, V, S, X, observed_mask)
+            dU, dV = solve_gauss_newton_step(U, V, S, X, observed_mask, R)
 
             U = retract_grassmann(U, dU)
             V = retract_grassmann(V, dV)
