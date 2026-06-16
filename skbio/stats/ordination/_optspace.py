@@ -40,7 +40,7 @@ from scipy.sparse.linalg import LinearOperator
 from scipy.sparse.linalg import cg
 
 
-def trim(X, observed_mask, m, n, n_observed):
+def _trim(X, observed_mask, m, n, n_observed):
     """Trim over-represented rows and columns.
 
     Any row or column with more than half the average observed entries per
@@ -262,7 +262,7 @@ def solve_gauss_newton_step(U, V, S, M_observed, observed_mask, R, damping=1e-1)
 
     # Solve the system by the conjugate gradient method
 
-    step, info = cg(A, b, rtol=1e-6, maxiter=50)
+    step, _ = cg(A, b, rtol=1e-6, maxiter=50)
 
     dU, dV = unpack(step, U.shape, V.shape)
 
@@ -385,10 +385,10 @@ class OptSpace:
         n_observed = np.sum(observed_mask)
 
         # Trim over-represented rows and columns
-        X_trimmed = trim(X, observed_mask, m, n, n_observed)
+        X_trimmed = _trim(X, observed_mask, m, n, n_observed)
 
         # Compute sparsity for rescaling
-        sparsity = n_observed / (n * m)
+        sparsity = n_observed / (n * m)  # Change to density
         epsilon = n_observed / np.sqrt(m * n)
 
         # Rescale observed values for sparse initialization
@@ -431,6 +431,11 @@ class OptSpace:
                 V = Vt[:r, :].T
         except Exception:
             # Fallback to random initialization
+
+            # When will this fail?
+            # Also, need to be able to specify seed if keeping this
+            # We do not want this to fail silently
+
             U = np.random.randn(n, r)
             V = np.random.randn(m, r)
             U, _ = np.linalg.qr(U)
@@ -438,10 +443,11 @@ class OptSpace:
             s = np.ones(r)
 
         prev_obj = np.inf
+        tol = self.tol
 
         for iteration in range(self.max_iterations):
             # Compute optimal S given current U, V
-            S = solve_S(U, V, X, observed_mask)
+            S = solve_S(U, V, X, observed_mask)  # Make functions private \/
 
             # Compute current error
             R = residual(U, V, S, X)
@@ -451,7 +457,7 @@ class OptSpace:
             # print(f"Iteration {iteration}, objective: {obj:.6f}")  # Delete
 
             # Check convergence
-            if abs(prev_obj - obj) < self.tol:
+            if np.abs(prev_obj - obj) < tol:
                 self.converged = True
                 break
 
