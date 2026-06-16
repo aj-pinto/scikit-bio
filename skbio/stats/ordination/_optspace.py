@@ -105,11 +105,6 @@ def estimate_rank(S, epsilon):
     # The last element is excluded because S[i] would be out of bounds
     i = np.arange(1, len(S))  # 1 , ... , k-1
     cost = (S[0] * np.sqrt(i / epsilon) + S[i]) / S[i - 1]
-    # print(f"Index {i}") # Delete
-    # print(f"S[i]: {S[i]}")
-    # print(f"S[i - 1]: {S[i - 1]}")
-    # print(f"epsilon: {epsilon}")
-    # print(f"Cost: {cost}") # Delete
 
     return i[np.argmin(cost)]
 
@@ -131,8 +126,6 @@ def solve_S(U, V, M_observed, observed_mask):
 
     r = U.shape[1]
 
-    n_observed = np.sum(observed_mask)
-
     rows, cols = np.where(observed_mask)
 
     A = np.einsum("ni,nj->nij", U[rows], V[cols]).reshape(len(rows), -1)
@@ -152,6 +145,13 @@ def residual(U, V, S, M_obs):
     R = np.nan_to_num(R, nan=0.0)
 
     return R
+
+    # See below:
+    # There may be an optimization in only computing R on the observed
+    # entries, but I have not yet gotten this to work.
+    # Rather than using scipy's CG to solve the system J*J η = -J*R, we could
+    # use scipy's lsmr to solve the system J η = -R without explicitly
+    # computing J*R (which is currently done).
 
     # (U_i S V_j^T) evaluated only on observed entries
     rows, cols = np.where(observed_mask)
@@ -260,14 +260,11 @@ def solve_gauss_newton_step(U, V, S, M_observed, observed_mask, R, damping=1e-1)
 
     A = LinearOperator((nvars, nvars), matvec=matvec, dtype=U.dtype)
 
-    # Solve the system by Conjugate Gradient
+    # Solve the system by the conjugate gradient method
 
     step, info = cg(A, b, rtol=1e-6, maxiter=50)
 
     dU, dV = unpack(step, U.shape, V.shape)
-
-    # dU -= U @ (U.T @ dU)
-    # dV -= V @ (V.T @ dV)
 
     return dU, dV
 
@@ -398,6 +395,15 @@ class OptSpace:
         X_trimmed *= sparsity  # max(sparsity, 1e-10)
 
         """
+
+        # Note:
+        # The original OptSpace paper gives a method for estimating the rank
+        # of a matrix, but I couldn't get this working accurately for all
+        # matrices. Depending on the singular value structure of the matrix,
+        # it seemed to drastically underestimate the rank in some
+        # cases, which in turn gives a very inaccurate reconstruction.
+        # This section seems optional, so it can safely be ignored for now.
+
         # Estimate rank
         U, s, Vt = svd(X_trimmed, full_matrices=False)
         #U, s, Vt = svds(X_trimmed, k=min(m, n) * 0.2)
@@ -407,16 +413,10 @@ class OptSpace:
 
         rhat = estimate_rank(s, epsilon)
 
-        #print(f"Estimated rank: {rhat}") # Delete
-        #print(f"Size of U and V: {U.shape}, {V.shape}, s: {s.shape}") # Delete
-
         # Compute the rank-rhat projection of the trimmed matrix
         U = U[:, :rhat]
         s = s[:rhat]
         V = V[:, :rhat]
-
-        #print(f"Estimated rank: {rhat}") # Delete
-        #print(f"Size of U and V: {U.shape}, {V.shape}, s: {s.shape}") # Delete
         """
 
         # Initialize with truncated SVD
@@ -437,9 +437,6 @@ class OptSpace:
             V, _ = np.linalg.qr(V)
             s = np.ones(r)
 
-        # Initialize S as diagonal matrix
-        # S = np.diag(s) / sparsity  # Scale back
-
         prev_obj = np.inf
 
         for iteration in range(self.max_iterations):
@@ -456,9 +453,6 @@ class OptSpace:
             # Check convergence
             if abs(prev_obj - obj) < self.tol:
                 self.converged = True
-                """print(
-                    f"Converged at iteration {iteration}, objective: {obj:.6f}"
-                )  # Delete"""
                 break
 
             prev_obj = obj
