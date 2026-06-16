@@ -147,7 +147,7 @@ def solve_S(U, V, M_observed, observed_mask):
 
 
 def residual(U, V, S, M_obs):
-    """Compute the residual R = P_Ω(USV^T - M_obs)."""
+    """Compute the residual R = P_Ω(U S V^T - M_obs)."""
     R = U @ S @ V.T - M_obs
     R = np.nan_to_num(R, nan=0.0)
 
@@ -165,7 +165,13 @@ def residual(U, V, S, M_obs):
 
 
 def jacobian_action(U, V, S, dU, dV, observed_mask):
-    """Compute J(dU, dV)."""
+    """Compute J(dU, dV).
+
+    The Jacobian action is a mapping from the tangent space of (U, V) to
+    the space of observed entries. It computes how changes in U and V (dU, dV)
+    affect the observed reconstruction error.
+
+    J(dU, dV) = dU S V^T + U S dV^T"""
 
     W = dU @ S @ V.T
     W += U @ S @ dV.T
@@ -174,7 +180,21 @@ def jacobian_action(U, V, S, dU, dV, observed_mask):
 
 
 def jacobian_adjoint(U, V, S, W):
-    """Compute J*(W)."""
+    """Compute J*(W).
+
+    The Jacobian adjoint is defined with respect to the inner product by
+
+    <J(dU, dV), W> = <(dU, dV), J*(W)>
+
+    It defines a mapping from the space of observed entries back to the
+    tangent space of (U, V). With J known,
+
+    J*(W) = (W V S^T, W^T U S)
+
+    This is projected back to the tangent space of (U, V):
+
+    J*(W)_U = (I - U U^T) W V S^T
+    J*(W)_V = (I - V V^T) W^T U S"""
 
     dU = W @ V @ S.T
     dV = W.T @ U @ S
@@ -186,7 +206,11 @@ def jacobian_adjoint(U, V, S, W):
 
 
 def gauss_newton_hvp(U, V, S, dU, dV, observed_mask, damping=0.0):
-    """Apply (J*J + λI) to a tangent vector."""
+    """Apply (J*J + λI) to a tangent vector.
+
+    The Hessian-Vector Product is used in the Conjugate Gradient
+    solver to compute the Gauss-Newton step. This avoids explicitly
+    forming the Hessian matrix."""
 
     W = jacobian_action(U, V, S, dU, dV, observed_mask)
     Hu, Hv = jacobian_adjoint(U, V, S, W)
@@ -194,22 +218,13 @@ def gauss_newton_hvp(U, V, S, dU, dV, observed_mask, damping=0.0):
     return Hu, Hv
 
 
-def gauss_newton_rhs(U, V, S, M_observed, observed_mask):
-    """Compute -J*(R)."""
-
-    R = U @ S @ V.T - M_observed
-    R = np.nan_to_num(R, nan=0.0)
-
-    gU, gV = jacobian_adjoint(U, V, S, R)
-
-    return -gU, -gV
-
-
 def pack(dU, dV):
+    """Pack dU and dV to a single vector η"""
     return np.concatenate([dU.ravel(), dV.ravel()])
 
 
 def unpack(x, U_shape, V_shape):
+    """Unpack the vector η back to dU and dV."""
     nu = np.prod(U_shape)
 
     dU = x[:nu].reshape(U_shape)
@@ -221,16 +236,20 @@ def unpack(x, U_shape, V_shape):
 def solve_gauss_newton_step(U, V, S, M_observed, observed_mask, R, damping=1e-1):
     """Solve (J*J+λI)η=-J*R.
 
-    The Gauss-Newton step η = (dU, dV) is computed by solving the linear system
-    using Conjugate Gradient."""
+    The Gauss-Newton step is the vector η = (dU, dV), where dU and dV are
+    tangent vectors in their respective Grassmann manifolds. The step is computed
+    by solving the linear system using the conjugate gradient method."""
 
-    # bU, bV = gauss_newton_rhs(U, V, S, M_observed, observed_mask)
+    # Right-hand side
 
     bU, bV = jacobian_adjoint(U, V, S, R)
 
     b = pack(-bU, -bV)
 
     nvars = b.size
+
+    # Matvec is passed to the LinearOperator, which computes (J*J + λI)η
+    # for a given η = (dU, dV)
 
     def matvec(x):
         dU, dV = unpack(x, U.shape, V.shape)
@@ -240,6 +259,8 @@ def solve_gauss_newton_step(U, V, S, M_observed, observed_mask, R, damping=1e-1)
         return pack(Hu, Hv)
 
     A = LinearOperator((nvars, nvars), matvec=matvec, dtype=U.dtype)
+
+    # Solve the system by Conjugate Gradient
 
     step, info = cg(A, b, rtol=1e-6, maxiter=50)
 
@@ -418,16 +439,14 @@ class OptSpace:
 
         # Initialize S as diagonal matrix
         # S = np.diag(s) / sparsity  # Scale back
-        S = solve_S(U, V, X, observed_mask)
-
-        ###
 
         prev_obj = np.inf
 
         for iteration in range(self.max_iterations):
+            # Compute optimal S given current U, V
             S = solve_S(U, V, X, observed_mask)
 
-            # Compute current reconstruction and error
+            # Compute current error
             R = residual(U, V, S, X)
 
             # Current objective (Frobenius norm of error)
@@ -444,12 +463,12 @@ class OptSpace:
 
             prev_obj = obj
 
+            # Compute Gauss-Newton step
             dU, dV = solve_gauss_newton_step(U, V, S, X, observed_mask, R)
 
+            # Retract updates back to Grassmann manifold
             U = retract_grassmann(U, dU)
             V = retract_grassmann(V, dV)
-
-            S = solve_S(U, V, X, observed_mask)
 
         # Final sort
         s_diag = np.diag(S)
