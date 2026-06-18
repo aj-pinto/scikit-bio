@@ -38,6 +38,7 @@ from scipy.sparse.linalg import svds
 from scipy.linalg import svd
 from scipy.sparse.linalg import LinearOperator
 from scipy.sparse.linalg import cg
+from scipy.sparse.linalg import lsmr
 
 
 def _trim(X, observed_mask, m, n, n_observed):
@@ -61,42 +62,7 @@ def _trim(X, observed_mask, m, n, n_observed):
     return np.where(trim_mask & observed_mask, X, 0.0)
 
 
-def _svd_sort(U, S, V):
-    """Sort SVD components by descending singular values.
-
-    Also applies sign correction for reproducibility.
-
-    Parameters
-    ----------
-    U : ndarray
-        Left singular vectors.
-    S : ndarray
-        Singular values.
-    V : ndarray
-        Right singular vectors.
-
-    Returns
-    -------
-    tuple
-        Sorted (U, S, V) with sign correction applied.
-    """
-    # Sort by descending singular values
-    idx = np.argsort(S)[::-1]
-    S = S[idx]
-    U = U[:, idx]
-    V = V[:, idx]
-
-    # Apply sign correction for reproducibility
-    # Make the largest element in each column of U positive
-    for i in range(U.shape[1]):
-        if np.abs(U[:, i].min()) > np.abs(U[:, i].max()):
-            U[:, i] *= -1
-            V[:, i] *= -1
-
-    return U, S, V
-
-
-def estimate_rank(S, epsilon):
+def _estimate_rank(S, epsilon):
     """Estimate rank r\\hat by minimizing the cost function of singular
     values from Keshavan et al. (2010).
     """
@@ -109,7 +75,7 @@ def estimate_rank(S, epsilon):
     return i[np.argmin(cost)]
 
 
-def solve_S(U, V, M_observed, observed_mask):
+def _solve_S(A, U, V, b, rows, cols):
     """Compute optimal S given U and V.
 
     Solves the least squares problem to find the optimal S
@@ -125,33 +91,33 @@ def solve_S(U, V, M_observed, observed_mask):
     """
 
     r = U.shape[1]
+    n_observed = len(rows)
 
-    rows, cols = np.where(observed_mask)
+    # Matrix A such that (USV^T)_ij = A_(i,j)(k,l) vec(S)_(k,l)
+    A = np.einsum("ni,nj->nij", U[rows], V[cols]).reshape(n_observed, -1)
 
-    A = np.einsum("ni,nj->nij", U[rows], V[cols]).reshape(len(rows), -1)
+    # Solve least-squares problem As = b
+    s = np.linalg.solve(A.T @ A, A.T @ b)
 
-    b = M_observed[rows, cols]
-
-    s = np.linalg.lstsq(A, b, rcond=None)[0]
-
-    S = s.reshape(r, r)
-
-    return S
+    return s.reshape(r, r)
 
 
-def residual(U, V, S, M_obs):
+def _update_residual(R, U, S, V, M_obs):
     """Compute the residual R = P_Ω(U S V^T - M_obs)."""
-    R = U @ S @ V.T - M_obs
-    R = np.nan_to_num(R, nan=0.0)
+    np.matmul(U @ S, V.T, out=R)
+    R -= M_obs
+    np.nan_to_num(R, nan=0.0, copy=False)
 
-    return R
+    return
 
-    # See below:
-    # There may be an optimization in only computing R on the observed
-    # entries, but I have not yet gotten this to work.
-    # Rather than using scipy's CG to solve the system J*J η = -J*R, we could
-    # use scipy's lsmr to solve the system J η = -R without explicitly
-    # computing J*R (which is currently done).
+    """
+    See below:
+    There may be an optimization in only computing R on the observed
+    entries, but I have not yet gotten this to work.
+    Rather than using scipy's CG to solve the system J*J η = -J*R, we could
+    use scipy's lsmr to solve the system J η = -R without explicitly
+    computing J*R (which is currently done).
+    """
 
     # (U_i S V_j^T) evaluated only on observed entries
     rows, cols = np.where(observed_mask)
@@ -176,10 +142,10 @@ def jacobian_action(U, V, S, dU, dV, observed_mask):
     W = dU @ S @ V.T
     W += U @ S @ dV.T
 
-    return W * observed_mask
+    return W.ravel()
 
 
-def jacobian_adjoint(U, V, S, W):
+def jacobian_adjoint(U, V, S, W, observed_mask):
     """Compute J*(W).
 
     The Jacobian adjoint is defined with respect to the inner product by
@@ -196,6 +162,8 @@ def jacobian_adjoint(U, V, S, W):
     J*(W)_U = (I - U U^T) W V S^T
     J*(W)_V = (I - V V^T) W^T U S"""
 
+    W = W.reshape(observed_mask.shape)
+
     dU = W @ V @ S.T
     dV = W.T @ U @ S
 
@@ -203,19 +171,6 @@ def jacobian_adjoint(U, V, S, W):
     dV -= V @ (V.T @ dV)
 
     return dU, dV
-
-
-def gauss_newton_hvp(U, V, S, dU, dV, observed_mask, damping=0.0):
-    """Apply (J*J + λI) to a tangent vector.
-
-    The Hessian-Vector Product is used in the Conjugate Gradient
-    solver to compute the Gauss-Newton step. This avoids explicitly
-    forming the Hessian matrix."""
-
-    W = jacobian_action(U, V, S, dU, dV, observed_mask)
-    Hu, Hv = jacobian_adjoint(U, V, S, W)
-
-    return Hu, Hv
 
 
 def pack(dU, dV):
@@ -233,40 +188,34 @@ def unpack(x, U_shape, V_shape):
     return dU, dV
 
 
-def solve_gauss_newton_step(U, V, S, M_observed, observed_mask, R, damping=1e-1):
-    """Solve (J*J+λI)η=-J*R.
+def solve_gauss_newton_step(U, V, S, observed_mask, R, damping=1e-1):
+    """Solve (J*J)η=-J*R.
 
     The Gauss-Newton step is the vector η = (dU, dV), where dU and dV are
-    tangent vectors in their respective Grassmann manifolds. The step is computed
-    by solving the linear system using the conjugate gradient method."""
+    tangent vectors in their respective Grassmann manifolds. The step is the
+    least-squares solution of the system Jη = -R. This is computed using
+    the LSMR algorithm."""
 
-    # Right-hand side
-
-    bU, bV = jacobian_adjoint(U, V, S, R)
-
-    b = pack(-bU, -bV)
-
-    nvars = b.size
-
-    # Matvec is passed to the LinearOperator, which computes (J*J + λI)η
-    # for a given η = (dU, dV)
+    nvars = U.size + V.size
 
     def matvec(x):
         dU, dV = unpack(x, U.shape, V.shape)
+        return jacobian_action(U, V, S, dU, dV, observed_mask)
 
-        Hu, Hv = gauss_newton_hvp(U, V, S, dU, dV, observed_mask, damping=damping)
+    def rmatvec(y):
+        dU, dV = jacobian_adjoint(U, V, S, y, observed_mask)
+        return pack(dU, dV)
 
-        return pack(Hu, Hv)
+    J = LinearOperator(
+        shape=(R.size, nvars),
+        matvec=matvec,
+        rmatvec=rmatvec,
+        dtype=U.dtype,
+    )
 
-    A = LinearOperator((nvars, nvars), matvec=matvec, dtype=U.dtype)
+    step = lsmr(J, -R.ravel(), atol=1e-6, btol=1e-6)[0]
 
-    # Solve the system by the conjugate gradient method
-
-    step, _ = cg(A, b, rtol=1e-6, maxiter=50)
-
-    dU, dV = unpack(step, U.shape, V.shape)
-
-    return dU, dV
+    return unpack(step, U.shape, V.shape)
 
 
 def retract_grassmann(X, dX):
@@ -340,7 +289,7 @@ class OptSpace:
 
     """
 
-    def __init__(self, n_components=3, max_iterations=5, tol=1e-5):
+    def __init__(self, n_components=3, max_iterations=100, tol=1e-5):
         self.n_components = n_components
         self.max_iterations = max_iterations
         self.tol = tol
@@ -367,6 +316,7 @@ class OptSpace:
         ValueError
             If input is not 2D or n_components exceeds matrix dimensions.
         """
+
         X = np.asarray(X, dtype=np.float64)
 
         if X.ndim != 2:
@@ -411,7 +361,7 @@ class OptSpace:
         U, s, V = _svd_sort(U, s, V)
         print(s) # Delete
 
-        rhat = estimate_rank(s, epsilon)
+        rhat = _estimate_rank(s, epsilon)
 
         # Compute the rank-rhat projection of the trimmed matrix
         U = U[:, :rhat]
@@ -422,12 +372,14 @@ class OptSpace:
         # Initialize with truncated SVD
         try:
             if r < min(n, m) - 1:
-                U, s, Vt = svds(X_trimmed, k=r)
+                # U, s, Vt = svds(X_trimmed, k=r)
+                U, _, Vt = svds(X_trimmed, k=r)
                 V = Vt.T
             else:
-                U, s, Vt = svd(X_trimmed, full_matrices=False)
+                # U, s, Vt = svd(X_trimmed, full_matrices=False)
+                U, _, Vt = svd(X_trimmed, full_matrices=False)
                 U = U[:, :r]
-                s = s[:r]
+                # s = s[:r]
                 V = Vt[:r, :].T
         except Exception:
             # Fallback to random initialization
@@ -445,39 +397,39 @@ class OptSpace:
         prev_obj = np.inf
         tol = self.tol
 
+        R = np.empty((m, n))
+        S = np.empty((r, r))
+        A = np.empty((n_observed, r**2))
+
+        rows, cols = np.where(observed_mask)
+        b = X[rows, cols]
+
         for iteration in range(self.max_iterations):
             # Compute optimal S given current U, V
-            S = solve_S(U, V, X, observed_mask)  # Make functions private \/
+            S = _solve_S(A, U, V, b, rows, cols)
 
             # Compute current error
-            R = residual(U, V, S, X)
+            _update_residual(R, U, S, V, X)
 
             # Current objective (Frobenius norm of error)
             obj = np.sum(R**2)
-            # print(f"Iteration {iteration}, objective: {obj:.6f}")  # Delete
+            print(f"Iteration {iteration}, objective: {obj:.6f}")  # Delete
 
             # Check convergence
-            if np.abs(prev_obj - obj) < tol:
+            if np.abs(prev_obj - obj) / obj < tol:
                 self.converged = True
                 break
 
             prev_obj = obj
 
             # Compute Gauss-Newton step
-            dU, dV = solve_gauss_newton_step(U, V, S, X, observed_mask, R)
+            dU, dV = solve_gauss_newton_step(U, V, S, observed_mask, R)
 
             # Retract updates back to Grassmann manifold
             U = retract_grassmann(U, dU)
             V = retract_grassmann(V, dV)
 
-        # Final sort
-        s_diag = np.diag(S)
-        U, s_diag, V = _svd_sort(U, s_diag, V)
-        S = np.diag(s_diag)
-
-        self.U = U
-        self.S = S
-        self.V = V
+        self.X_hat = U @ S @ V.T
 
         return self
 
@@ -499,10 +451,30 @@ class OptSpace:
         ValueError
             If the model has not been fitted.
         """
-        if self.U is None:
-            raise ValueError("Model has not been fitted. Call fit() first.")
 
-        return self.U.dot(self.S).dot(self.V.T)
+        """
+        Note:
+        I've changed this from the original implementation.
+
+        Currently, in fit(), U and V are continually updated as mxr and nxr orthogonal
+        matrices, and S is computed as a rank 5 matrices (but NOT necessarily
+        a diagonal one).
+
+        So, we can form the reconstruction simply from USV^T. To recover a true
+        diagonal matrix S, we would have to recompute the SVD. We can safely leave
+        this to the RPCA function, since the RPCA function is essentially a wrapper
+        for OptSpace followed by SVD anyway.
+
+        OptSpace may be able to be rewritten as a function rather than a whole class,
+        but features of the Gemelli OptSpace may not be compatible with this.
+
+        Currently, though, much of this architecture is redundant outside of fit().
+        """
+
+        # if self.U is None:
+        #     raise ValueError("Model has not been fitted. Call fit() first.")
+
+        return self.X_hat  # self.U.dot(self.S).dot(self.V.T)
 
     def fit_transform(self, X):
         """Fit the model and return the reconstructed matrix.
