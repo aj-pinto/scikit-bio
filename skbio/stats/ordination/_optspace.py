@@ -94,7 +94,10 @@ def _solve_S(A, U, V, b, rows, cols):
     n_observed = len(rows)
 
     # Matrix A such that (USV^T)_ij = A_(i,j)(k,l) vec(S)_(k,l)
-    A = np.einsum("ni,nj->nij", U[rows], V[cols]).reshape(n_observed, -1)
+    # A = np.einsum("ni,nj->nij", U[rows], V[cols]).reshape(n_observed, -1)
+    A = A.reshape(n_observed, r, r)
+    np.einsum("ni,nj->nij", U[rows], V[cols], out=A)
+    A = A.reshape(n_observed, r**2)
 
     # Solve least-squares problem As = b
     s = np.linalg.solve(A.T @ A, A.T @ b)
@@ -108,26 +111,48 @@ def _update_residual(R, U, S, V, M_obs):
     R -= M_obs
     np.nan_to_num(R, nan=0.0, copy=False)
 
-    return
-
     """
-    See below:
-    There may be an optimization in only computing R on the observed
-    entries, but I have not yet gotten this to work.
-    Rather than using scipy's CG to solve the system J*J η = -J*R, we could
-    use scipy's lsmr to solve the system J η = -R without explicitly
-    computing J*R (which is currently done).
+    Note:
+    A potentially big optimization may be found in computing R only on the observed
+    entries. The reasoning is as follows:
+    We must compute the matrix A with dimension n_observed x r^2 to solve the system
+    As = m,
+    where s is the vector (size r^2) containing the entries of the rxr square
+    matrix S, and m is the vector (size n_observed) containing the observed entries
+    of M_obs.
+    Once s is found, the same matrix A can be used to compute
+    m_hat = As.
+    This is the vector (size n_observed) of the reconstructed matrix USV^T, *only on
+    the observed entries*. This immediately gives a way of computing the residual
+    vector,
+    r =  m_hat - m,
+    which is also size n_observed.
+
+    The Jacobian J gives a map from the tangent space of pairs (U, V) onto the space
+    of projected entries. The output takes the form of a matrix W (size mxn), which is
+    projected onto the space of observed entries: P_omega (W). In other words, this
+    is a dense mxn matrix, where m * n - n_observed entries are just zero.
+    For the Jacobian J, it is no problem to simply truncate dU and dV to instead return
+    a vector with only the observed entries, rather than the entire sparse matrix W.
+
+    The problem comes from the Jacobian adjoint, which must reconstruct (dU, dV) from
+    a vector (size n_observed) in the space of observed entries.
+    If the full dense matrix P_omega(W) is passed to the Jacobian adjoint, the dense
+    matrices (dU, dV) can be easily reconstructed through matrix multiplication.
+    However, if a vector of observed entries is passed, the dense matrix must be
+    reconstructed or otherwise iteratively accumulated. This is extremely slow.
+
+    I see this as the greatest potential benefit for GPU acceleration with numba.
+    If the reconstruction of the dense matrix can be sped up, only the vector of
+    observed entries can be stored, drastically reducing memory requirements
+    and reducing the total number of operations. If this can be accomplished, each
+    iteration would only compute
+    A -> s -> m_hat -> r -> (dU, dV)
+    rather than
+    A -> s -> S -> USV^T -> R -> (dU, dV)
+    The matrix A must be computed regardless, so if we can reuse it rather than
+    recomputing USV^T, it could be highly beneficial.
     """
-
-    # (U_i S V_j^T) evaluated only on observed entries
-    rows, cols = np.where(observed_mask)
-    Ui = U[rows]  # (n_obs, r)
-    Vj = V[cols]  # (n_obs, r)
-
-    R = np.einsum("ir,rs,is->i", Ui, S, Vj)  # (n_obs,)
-    R -= M_obs[rows, cols]  # (n_obs,)
-
-    return R
 
 
 def jacobian_action(U, V, S, dU, dV, observed_mask):
@@ -174,12 +199,12 @@ def jacobian_adjoint(U, V, S, W, observed_mask):
 
 
 def pack(dU, dV):
-    """Pack dU and dV to a single vector η"""
+    """Pack dU and dV to a single vector dx"""
     return np.concatenate([dU.ravel(), dV.ravel()])
 
 
 def unpack(x, U_shape, V_shape):
-    """Unpack the vector η back to dU and dV."""
+    """Unpack the vector dx back to dU and dV."""
     nu = np.prod(U_shape)
 
     dU = x[:nu].reshape(U_shape)
@@ -189,11 +214,11 @@ def unpack(x, U_shape, V_shape):
 
 
 def solve_gauss_newton_step(U, V, S, observed_mask, R, damping=1e-1):
-    """Solve (J*J)η=-J*R.
+    """Solve (J*J)dx = -J*R.
 
-    The Gauss-Newton step is the vector η = (dU, dV), where dU and dV are
+    The Gauss-Newton step is the vector dx = (dU, dV), where dU and dV are
     tangent vectors in their respective Grassmann manifolds. The step is the
-    least-squares solution of the system Jη = -R. This is computed using
+    least-squares solution of the system Jdx = -R, and it is computed using
     the LSMR algorithm."""
 
     nvars = U.size + V.size
@@ -262,9 +287,8 @@ class OptSpace:
     1. Initialize U, V using trimmed SVD of the observed matrix
     2. Iteratively:
        a. Compute optimal S given current U, V
-       b. Compute gradients with respect to U, V
-       c. Update U, V using gradient descent with line search
-       d. Project U, V back to Grassmann manifold
+       b. Update U, V with the Gauss-Newton step dU, dV
+       c. Project U, V back to Grassmann manifold
 
     References
     ----------
@@ -339,7 +363,6 @@ class OptSpace:
 
         # Compute sparsity for rescaling
         sparsity = n_observed / (n * m)  # Change to density
-        epsilon = n_observed / np.sqrt(m * n)
 
         # Rescale observed values for sparse initialization
         X_trimmed *= sparsity  # max(sparsity, 1e-10)
@@ -356,43 +379,45 @@ class OptSpace:
 
         # Estimate rank
         U, s, Vt = svd(X_trimmed, full_matrices=False)
-        #U, s, Vt = svds(X_trimmed, k=min(m, n) * 0.2)
+        #U, s, Vt = svds(X_trimmed, k=min(m, n) * 0.2) # Assume rank r < 0.2 min(m,n)
         V = Vt.T
         U, s, V = _svd_sort(U, s, V)
-        print(s) # Delete
 
+        epsilon = n_observed / np.sqrt(m * n)
         rhat = _estimate_rank(s, epsilon)
 
         # Compute the rank-rhat projection of the trimmed matrix
         U = U[:, :rhat]
-        s = s[:rhat]
         V = V[:, :rhat]
         """
 
         # Initialize with truncated SVD
+        # Note that we do not need to keep S in this step, since
+        #
         try:
             if r < min(n, m) - 1:
-                # U, s, Vt = svds(X_trimmed, k=r)
                 U, _, Vt = svds(X_trimmed, k=r)
                 V = Vt.T
             else:
-                # U, s, Vt = svd(X_trimmed, full_matrices=False)
                 U, _, Vt = svd(X_trimmed, full_matrices=False)
                 U = U[:, :r]
-                # s = s[:r]
                 V = Vt[:r, :].T
         except Exception:
             # Fallback to random initialization
 
-            # When will this fail?
-            # Also, need to be able to specify seed if keeping this
-            # We do not want this to fail silently
+            """
+            This must be changed:
+            1. When will SVD fail? Shouldn't every matrix have an SVD?
+               and if an algorithm as robust as SVD is failing,
+               wouldn't that be important for the user to know?
+            2. We do not want this to fail silently
+            3. Need to be able to specify rng seed if keeping this
+            """
 
             U = np.random.randn(n, r)
             V = np.random.randn(m, r)
             U, _ = np.linalg.qr(U)
             V, _ = np.linalg.qr(V)
-            s = np.ones(r)
 
         prev_obj = np.inf
         tol = self.tol
@@ -416,7 +441,7 @@ class OptSpace:
             print(f"Iteration {iteration}, objective: {obj:.6f}")  # Delete
 
             # Check convergence
-            if np.abs(prev_obj - obj) / obj < tol:
+            if np.abs(prev_obj - obj) < tol:
                 self.converged = True
                 break
 
@@ -457,7 +482,7 @@ class OptSpace:
         I've changed this from the original implementation.
 
         Currently, in fit(), U and V are continually updated as mxr and nxr orthogonal
-        matrices, and S is computed as a rank 5 matrices (but NOT necessarily
+        matrices, and S is computed as a rank 5 matrix (but NOT necessarily
         a diagonal one).
 
         So, we can form the reconstruction simply from USV^T. To recover a true
