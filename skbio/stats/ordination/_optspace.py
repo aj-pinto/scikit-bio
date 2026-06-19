@@ -166,6 +166,7 @@ def jacobian_action(U, V, S, dU, dV, observed_mask):
 
     W = dU @ S @ V.T
     W += U @ S @ dV.T
+    W *= observed_mask
 
     return W.ravel()
 
@@ -188,6 +189,7 @@ def jacobian_adjoint(U, V, S, W, observed_mask):
     J*(W)_V = (I - V V^T) W^T U S"""
 
     W = W.reshape(observed_mask.shape)
+    W *= observed_mask
 
     dU = W @ V @ S.T
     dV = W.T @ U @ S
@@ -238,7 +240,7 @@ def solve_gauss_newton_step(U, V, S, observed_mask, R, damping=1e-1):
         dtype=U.dtype,
     )
 
-    step = lsmr(J, -R.ravel(), atol=1e-6, btol=1e-6)[0]
+    step = lsmr(J, -R.ravel(), atol=1e-5, btol=1e-5)[0]
 
     return unpack(step, U.shape, V.shape)
 
