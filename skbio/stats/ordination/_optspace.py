@@ -432,8 +432,27 @@ class OptSpace:
         b = X[rows, cols]
 
         for iteration in range(self.max_iterations):
+
+            def mat_A(s):
+                As = U @ s.reshape(r, r) @ V.T
+                return As[rows, cols]
+
+            def mat_A_T(w):
+                Atw = U[rows].T @ (w[:, None] * V[cols]).reshape(-1, r)
+                return Atw.ravel()
+
+            A_operator = LinearOperator(
+                shape=(n_observed, r**2),
+                matvec=mat_A,
+                rmatvec=mat_A_T,
+                dtype=U.dtype,
+            )
+
+            S = lsmr(A_operator, b, atol=1e-5, btol=1e-5)[0]
+            S = S.reshape(r, r)
+
             # Compute optimal S given current U, V
-            S = _solve_S(A, U, V, b, rows, cols)
+            # S = _solve_S(A, U, V, b, rows, cols)
 
             # Compute current error
             _update_residual(R, U, S, V, X)
