@@ -155,7 +155,7 @@ def _update_residual(R, U, S, V, M_obs):
     """
 
 
-def jacobian_action(U, V, S, dU, dV, observed_mask):
+def jacobian_action(U, V, S, dU, dV, observed_mask, A, AtAinv):
     """Compute J(dU, dV).
 
     The Jacobian action is a mapping from the tangent space of (U, V) to
@@ -164,14 +164,20 @@ def jacobian_action(U, V, S, dU, dV, observed_mask):
 
     J(dU, dV) = dU S V^T + U S dV^T"""
 
+    rows, cols = np.where(observed_mask)
+    dU -= U @ U.T @ dU
+    dV -= V @ V.T @ dV
     W = dU @ S @ V.T
     W += U @ S @ dV.T
-    W *= observed_mask
+    w = W[rows, cols]
+    w -= A @ (AtAinv @ (A.T @ w))
+    psw = A @ (AtAinv @ (A.T @ w))
 
-    return W.ravel()
+    # print(f"Magnitude ratio: {np.linalg.norm(psw)**2 / np.linalg.norm(w)**2}")
+    return w
 
 
-def jacobian_adjoint(U, V, S, W, observed_mask):
+def jacobian_adjoint(U, V, S, w, observed_mask, A, AtAinv):
     """Compute J*(W).
 
     The Jacobian adjoint is defined with respect to the inner product by
@@ -188,8 +194,8 @@ def jacobian_adjoint(U, V, S, W, observed_mask):
     J*(W)_U = (I - U U^T) W V S^T
     J*(W)_V = (I - V V^T) W^T U S"""
 
-    W = W.reshape(observed_mask.shape)
-    W *= observed_mask
+    W = np.zeros(observed_mask.shape)
+    W[observed_mask] = w - A @ (AtAinv @ (A.T @ w))
 
     dU = W @ V @ S.T
     dV = W.T @ U @ S
@@ -215,7 +221,7 @@ def unpack(x, U_shape, V_shape):
     return dU, dV
 
 
-def solve_gauss_newton_step(U, V, S, observed_mask, R, damping=1e-1):
+def solve_gauss_newton_step(U, V, S, observed_mask, R, A, AtAinv, damping=1e-1):
     """Solve (J*J)dx = -J*R.
 
     The Gauss-Newton step is the vector dx = (dU, dV), where dU and dV are
@@ -227,20 +233,23 @@ def solve_gauss_newton_step(U, V, S, observed_mask, R, damping=1e-1):
 
     def matvec(x):
         dU, dV = unpack(x, U.shape, V.shape)
-        return jacobian_action(U, V, S, dU, dV, observed_mask)
+        return jacobian_action(U, V, S, dU, dV, observed_mask, A, AtAinv)
 
     def rmatvec(y):
-        dU, dV = jacobian_adjoint(U, V, S, y, observed_mask)
+        dU, dV = jacobian_adjoint(U, V, S, y, observed_mask, A, AtAinv)
         return pack(dU, dV)
 
     J = LinearOperator(
-        shape=(R.size, nvars),
+        shape=(np.sum(observed_mask), nvars),
         matvec=matvec,
         rmatvec=rmatvec,
         dtype=U.dtype,
     )
 
-    step = lsmr(J, -R.ravel(), atol=1e-5, btol=1e-5)[0]
+    result = lsmr(J, -R.ravel(), atol=1e-5, btol=1e-5)
+    step = result[0]
+    iter = result[2]
+    print(f"Iterations: {iter}")
 
     return unpack(step, U.shape, V.shape)
 
@@ -424,7 +433,7 @@ class OptSpace:
         prev_obj = np.inf
         tol = self.tol
 
-        R = np.empty((m, n))
+        R = np.empty(n_observed)
         S = np.empty((r, r))
         A = np.empty((n_observed, r**2))
 
@@ -432,6 +441,18 @@ class OptSpace:
         b = X[rows, cols]
 
         for iteration in range(self.max_iterations):
+            # Matrix A such that (USV^T)_ij = A_(i,j)(k,l) vec(S)_(k,l)
+            # A = np.einsum("ni,nj->nij", U[rows], V[cols]).reshape(n_observed, -1)
+
+            A = A.reshape(n_observed, r, r)
+            np.einsum("ni,nj->nij", U[rows], V[cols], out=A)
+            A = A.reshape(n_observed, r**2)
+            AtA = A.T @ A
+            AtAinv = np.linalg.inv(AtA)
+            s = AtAinv @ (A.T @ b)
+
+            # Solve least-squares problem As = b
+            # s = np.linalg.solve(A.T @ A, A.T @ b)
 
             def mat_A(s):
                 As = U @ s.reshape(r, r) @ V.T
@@ -448,14 +469,16 @@ class OptSpace:
                 dtype=U.dtype,
             )
 
-            S = lsmr(A_operator, b, atol=1e-5, btol=1e-5)[0]
-            S = S.reshape(r, r)
+            # S = lsmr(A_operator, b, atol=1e-5, btol=1e-5)[0]
+            # S = S.reshape(r, r)
 
             # Compute optimal S given current U, V
             # S = _solve_S(A, U, V, b, rows, cols)
 
+            # _update_residual(R, U, S, V, X)
+
             # Compute current error
-            _update_residual(R, U, S, V, X)
+            R = A @ s - b
 
             # Current objective (Frobenius norm of error)
             obj = np.sum(R**2)
@@ -469,13 +492,15 @@ class OptSpace:
             prev_obj = obj
 
             # Compute Gauss-Newton step
-            dU, dV = solve_gauss_newton_step(U, V, S, observed_mask, R)
+            dU, dV = solve_gauss_newton_step(
+                U, V, s.reshape(r, r), observed_mask, R, A, AtAinv
+            )
 
             # Retract updates back to Grassmann manifold
             U = retract_grassmann(U, dU)
             V = retract_grassmann(V, dV)
 
-        self.X_hat = U @ S @ V.T
+        self.X_hat = U @ s.reshape(r, r) @ V.T
 
         return self
 
