@@ -37,7 +37,6 @@ import numpy as np
 from scipy.sparse.linalg import svds
 from scipy.linalg import svd
 from scipy.sparse.linalg import LinearOperator
-from scipy.sparse.linalg import cg
 from scipy.sparse.linalg import lsmr
 
 
@@ -46,7 +45,7 @@ def _trim(X, observed_mask, m, n, n_observed):
 
     Any row or column with more than half the average observed entries per
     row or column respectively is set to zero per Keshavan et al. (2010).
-    This makes the low-rank structure more pronounced.)"""
+    This makes the low-rank structure more pronounced."""
 
     n_observed_rows = np.sum(observed_mask, axis=1)
     n_observed_cols = np.sum(observed_mask, axis=0)
@@ -78,8 +77,8 @@ def _estimate_rank(S, epsilon):
 def _solve_S(A, U, V, b, rows, cols):
     """Compute optimal S given U and V.
 
-    Solves the least squares problem to find the optimal S
-    that minimizes reconstruction difference on the observed entries:
+    Solves the least squares problem to find the optimal S that
+    minimizes the reconstruction difference on the observed entries:
 
     arg min_S ||P_\\Omega(U V S^T - M_observed)||_F^2
 
@@ -369,11 +368,11 @@ class OptSpace:
         # Trim over-represented rows and columns
         X_trimmed = _trim(X, observed_mask, m, n, n_observed)
 
-        # Compute sparsity for rescaling
-        sparsity = n_observed / (n * m)  # Change to density
+        # Compute density for rescaling
+        density = n_observed / (n * m)
 
         # Rescale observed values for sparse initialization
-        X_trimmed *= sparsity  # max(sparsity, 1e-10)
+        X_trimmed *= density
 
         """
 
@@ -400,32 +399,16 @@ class OptSpace:
         """
 
         # Initialize with truncated SVD
-        # Note that we do not need to keep S in this step, since
-        #
-        try:
-            if r < min(n, m) - 1:
-                U, _, Vt = svds(X_trimmed, k=r)
-                V = Vt.T
-            else:
-                U, _, Vt = svd(X_trimmed, full_matrices=False)
-                U = U[:, :r]
-                V = Vt[:r, :].T
-        except Exception:
-            # Fallback to random initialization
+        # Note that we do not need to keep S in this step, since it is immediately
+        # recomputed based on the observed entries only.
 
-            """
-            This must be changed:
-            1. When will SVD fail? Shouldn't every matrix have an SVD?
-               and if an algorithm as robust as SVD is failing,
-               wouldn't that be important for the user to know?
-            2. We do not want this to fail silently
-            3. Need to be able to specify rng seed if keeping this
-            """
-
-            U = np.random.randn(n, r)
-            V = np.random.randn(m, r)
-            U, _ = np.linalg.qr(U)
-            V, _ = np.linalg.qr(V)
+        if r < min(n, m) - 1:
+            U, _, Vt = svds(X_trimmed, k=r)
+            V = Vt.T
+        else:
+            U, _, Vt = svd(X_trimmed, full_matrices=False)
+            U = U[:, :r]
+            V = Vt[:r, :].T
 
         prev_obj = np.inf
         tol = self.tol
