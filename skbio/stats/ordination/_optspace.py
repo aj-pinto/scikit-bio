@@ -16,9 +16,9 @@ The algorithm minimizes the objective:
 
 .. math::
 
-    \min_{U, V, S} \|P_\Omega(Y - USV^T)\|_F^2
+    \min_{U, V, S} \|P_\Omega(M_{obs} - USV^T)\|_F^2
 
-where :math:`Y` is the observed matrix, :math:`U` and :math:`V` are the
+where :math:`M_{obs}` is the observed matrix, :math:`U` and :math:`V` are the
 left and right singular vector matrices, :math:`S` is the diagonal matrix
 of singular values, and :math:`P_\Omega` projects onto the observed entries.
 
@@ -45,7 +45,8 @@ def _trim(X, observed_mask, m, n, n_observed):
 
     Any row or column with more than half the average observed entries per
     row or column respectively is set to zero per Keshavan et al. (2010).
-    This makes the low-rank structure more pronounced."""
+    This makes the low-rank structure of the observed data more
+    prominent."""
 
     n_observed_rows = np.sum(observed_mask, axis=1)
     n_observed_cols = np.sum(observed_mask, axis=0)
@@ -63,7 +64,9 @@ def _trim(X, observed_mask, m, n, n_observed):
 
 def _estimate_rank(S, epsilon):
     """Estimate rank r\\hat by minimizing the cost function of singular
-    values from Keshavan et al. (2010).
+    values from Keshavan et al. (2010):
+
+    R(i) = (\\sigma_{i+1} + \\sigma_1 \\sqrt{i / \\epsilon}) / \\sigma_i
     """
 
     # Indices i = 1, 2, ... , len(S) - 1
@@ -74,7 +77,7 @@ def _estimate_rank(S, epsilon):
     return i[np.argmin(cost)]
 
 
-def _solve_S(A, U, V, b, rows, cols):
+def _solve_S(U, V, b, observed_mask, tol):
     """Compute optimal S given U and V.
 
     Solves the least squares problem to find the optimal S that
@@ -83,114 +86,110 @@ def _solve_S(A, U, V, b, rows, cols):
     arg min_S ||P_\\Omega(U V S^T - M_observed)||_F^2
 
     where P_\\Omega is the projection onto the observed entries.
-    Since only the observed entries are considered, the problem
-    can be vectorized and solved efficiently using least squares:
+    This is the least-squares solution to the system
 
-    arg min_S \\sum_{(i,j) \\in \\Omega} (U[i] S V[j]^T - M_observed[i, j])^2
+    J_S(dS) = -R
+
+    This is solved via lsmr.
     """
 
     r = U.shape[1]
-    n_observed = len(rows)
+    n_observed = np.sum(observed_mask)
+    rows, cols = np.where(observed_mask)
 
-    # Matrix A such that (USV^T)_ij = A_(i,j)(k,l) vec(S)_(k,l)
-    # A = np.einsum("ni,nj->nij", U[rows], V[cols]).reshape(n_observed, -1)
-    A = A.reshape(n_observed, r, r)
-    np.einsum("ni,nj->nij", U[rows], V[cols], out=A)
-    A = A.reshape(n_observed, r**2)
+    def matvec(s):
+        return jacobian_S(U, V, s.reshape(r, r), rows, cols)
 
-    # Solve least-squares problem As = b
-    s = np.linalg.solve(A.T @ A, A.T @ b)
+    def rmatvec(w):
+        return jacobian_S_adj(U, V, w, observed_mask)
+
+    jacobian_S = LinearOperator(
+        shape=(n_observed, r**2),
+        matvec=matvec,
+        rmatvec=rmatvec,
+        dtype=U.dtype,
+    )
+
+    s = lsmr(jacobian_S, b, atol=tol, btol=tol)[0]
 
     return s.reshape(r, r)
 
 
-def _update_residual(R, U, S, V, M_obs):
-    """Compute the residual R = P_Ω(U S V^T - M_obs)."""
-    np.matmul(U @ S, V.T, out=R)
-    R -= M_obs
-    np.nan_to_num(R, nan=0.0, copy=False)
+def jacobian_S(U, V, S, rows, cols):
+    """Compute J_S(dS).
 
-    """
-    Note:
-    A potentially big optimization may be found in computing R only on the observed
-    entries. The reasoning is as follows:
-    We must compute the matrix A with dimension n_observed x r^2 to solve the system
-    As = m,
-    where s is the vector (size r^2) containing the entries of the rxr square
-    matrix S, and m is the vector (size n_observed) containing the observed entries
-    of M_obs.
-    Once s is found, the same matrix A can be used to compute
-    m_hat = As.
-    This is the vector (size n_observed) of the reconstructed matrix USV^T, *only on
-    the observed entries*. This immediately gives a way of computing the residual
-    vector,
-    r =  m_hat - m,
-    which is also size n_observed.
+    The Jacobian is
 
-    The Jacobian J gives a map from the tangent space of pairs (U, V) onto the space
-    of projected entries. The output takes the form of a matrix W (size mxn), which is
-    projected onto the space of observed entries: P_omega (W). In other words, this
-    is a dense mxn matrix, where m * n - n_observed entries are just zero.
-    For the Jacobian J, it is no problem to simply truncate dU and dV to instead return
-    a vector with only the observed entries, rather than the entire sparse matrix W.
+    J(dU, dV, dS) = J_S(dS) + J_U(dU) + J_V(dV).
 
-    The problem comes from the Jacobian adjoint, which must reconstruct (dU, dV) from
-    a vector (size n_observed) in the space of observed entries.
-    If the full dense matrix P_omega(W) is passed to the Jacobian adjoint, the dense
-    matrices (dU, dV) can be easily reconstructed through matrix multiplication.
-    However, if a vector of observed entries is passed, the dense matrix must be
-    reconstructed or otherwise iteratively accumulated. This is extremely slow.
+    The S component of the Jacobian determines how changes in S (dS) contribute to
+    the reconstruction error over the observed entries.
 
-    I see this as the greatest potential benefit for GPU acceleration with numba.
-    If the reconstruction of the dense matrix can be sped up, only the vector of
-    observed entries can be stored, drastically reducing memory requirements
-    and reducing the total number of operations. If this can be accomplished, each
-    iteration would only compute
-    A -> s -> m_hat -> r -> (dU, dV)
-    rather than
-    A -> s -> S -> USV^T -> R -> (dU, dV)
-    The matrix A must be computed regardless, so if we can reuse it rather than
-    recomputing USV^T, it could be highly beneficial.
+    J_S(dS) = P_\\Omega(U dS V^T).
     """
 
+    W = U @ S @ V.T
+    return W[rows, cols]
 
-def jacobian_action(U, V, S, dU, dV, observed_mask):
-    """Compute J(dU, dV).
 
-    The Jacobian action is a mapping from the tangent space of (U, V) to
-    the space of observed entries. It computes how changes in U and V (dU, dV)
-    affect the observed reconstruction error.
+def jacobian_S_adj(U, V, w, observed_mask):
+    """Compute J_S*(W).
 
-    J(dU, dV) = dU S V^T + U S dV^T"""
+    The Jacobian adjoint is defined with respect to the inner product by
 
-    rows, cols = np.where(observed_mask)
+    <J(dU, dV, dS), W> = <(dU, dV, dS), J*(W)>
+
+    Thus,
+
+    J_S*(W) = U^T P_\\Omega(W) V.
+    """
+
+    W = np.zeros_like(observed_mask, dtype=U.dtype)
+    W[observed_mask] = w
+    w = U.T @ W @ V
+    return w.ravel()
+
+
+def jacobian_UV(U, V, S, dU, dV, rows, cols):
+    """Compute J_UV(dU, dV).
+
+    The Jacobian is
+
+    J(dU, dV, dS) = J_S(dS) + J_U(dU) + J_V(dV),
+
+    where J_UV(dU, dV) = J_U(dU) + J_V(dV). The UV component of the Jacobian
+    determines how changes in U and V (dU, dV) contribute to the reconstruction
+    error over the observed entries.
+
+    J_UV(dU, dV) = P_\\Omega(dU S V^T + U S dV^T)
+
+    This is pre-composed with projection of the pair (dU, dV) onto the tangent
+    space of (U, V).
+    """
+
     dU -= U @ U.T @ dU
     dV -= V @ V.T @ dV
     W = dU @ S @ V.T
     W += U @ S @ dV.T
-    w = W[rows, cols]
 
-    return w
+    return W[rows, cols]
 
 
-def jacobian_adjoint(U, V, S, w, observed_mask):
+def jacobian_UV_adj(U, V, S, w, observed_mask):
     """Compute J*(W).
 
     The Jacobian adjoint is defined with respect to the inner product by
 
-    <J(dU, dV), W> = <(dU, dV), J*(W)>
+    <J(dU, dV, dS), W> = <(dU, dV, dS), J*(W)>
 
-    It defines a mapping from the space of observed entries back to the
-    tangent space of (U, V). With J known,
+    Thus,
 
-    J*(W) = (W V S^T, W^T U S)
+    J_UV*(W) = (P_\\Omega(W) V S^T, P_\\Omega(W)^T U S)
 
-    This is projected back to the tangent space of (U, V):
+    This is projected back to the tangent space of (U, V).
+    """
 
-    J*(W)_U = (I - U U^T) W V S^T
-    J*(W)_V = (I - V V^T) W^T U S"""
-
-    W = np.zeros(observed_mask.shape)
+    W = np.zeros_like(observed_mask, dtype=U.dtype)
     W[observed_mask] = w
 
     dU = W @ V @ S.T
@@ -217,22 +216,24 @@ def unpack(x, U_shape, V_shape):
     return dU, dV
 
 
-def solve_gauss_newton_step(U, V, S, observed_mask, R, damping=1e-1):
-    """Solve (J*J)dx = -J*R.
+def solve_gauss_newton_step(U, V, S, observed_mask, R, tol):
+    """Solve (J_UV* J_UV)dx = -J_UV* R.
 
     The Gauss-Newton step is the vector dx = (dU, dV), where dU and dV are
     tangent vectors in their respective Grassmann manifolds. The step is the
-    least-squares solution of the system Jdx = -R, and it is computed using
-    the LSMR algorithm."""
+    least-squares solution of the system J_UV dx = -R, and it is computed using
+    the LSMR algorithm.
+    """
 
     nvars = U.size + V.size
+    rows, cols = np.where(observed_mask)
 
     def matvec(x):
         dU, dV = unpack(x, U.shape, V.shape)
-        return jacobian_action(U, V, S, dU, dV, observed_mask)
+        return jacobian_UV(U, V, S, dU, dV, rows, cols)
 
     def rmatvec(y):
-        dU, dV = jacobian_adjoint(U, V, S, y, observed_mask)
+        dU, dV = jacobian_UV_adj(U, V, S, y, observed_mask)
         return pack(dU, dV)
 
     J = LinearOperator(
@@ -242,10 +243,7 @@ def solve_gauss_newton_step(U, V, S, observed_mask, R, damping=1e-1):
         dtype=U.dtype,
     )
 
-    result = lsmr(J, -R.ravel(), atol=1e-5, btol=1e-5)
-    step = result[0]
-    iter = result[2]
-    print(f"Iterations: {iter}")
+    step = lsmr(J, -R.ravel(), atol=tol, btol=tol)[0]
 
     return unpack(step, U.shape, V.shape)
 
@@ -256,7 +254,7 @@ def retract_grassmann(X, dX):
     return Q[:, : X.shape[1]]
 
 
-class OptSpace:
+def optspace(X, dimensions=3, max_iterations=20, tol=1e-5):
     r"""Matrix completion using the OptSpace algorithm.
 
     OptSpace is an algorithm for recovering a low-rank matrix from a
@@ -265,23 +263,24 @@ class OptSpace:
 
     Parameters
     ----------
-    n_components : int, optional
+    X : ndarray
+        A 2D array with observed values and NaN for missing entries.
+    dimensions : int, optional
         The rank of the matrix to recover. Default is 3.
     max_iterations : int, optional
-        Maximum number of iterations. Default is 5.
+        Maximum number of iterations. Default is 20.
     tol : float, optional
         Convergence tolerance. Default is 1e-5.
 
-    Attributes
-    ----------
-    U : ndarray
-        Left singular vectors after fitting.
-    S : ndarray
-        Singular values (as diagonal matrix) after fitting.
-    V : ndarray
-        Right singular vectors after fitting.
-    converged : bool
-        Whether the algorithm converged.
+    Returns
+    -------
+    X_hat
+        The reconstructed optimal low-rank matrix.
+
+    Raises
+    ------
+    ValueError
+        If input is not 2D or dimensions exceeds matrix dimensions.
 
     See Also
     --------
@@ -315,258 +314,116 @@ class OptSpace:
     >>> M_observed = true_M.copy()
     >>> M_observed[::2, ::2] = np.nan  # Hide some entries
     >>> # Recover the matrix
-    >>> opt = OptSpace(n_components=2, max_iterations=10)
+    >>> opt = OptSpace(dimensions=2, max_iterations=10)
     >>> M_recovered = opt.fit_transform(M_observed)
-
     """
 
-    def __init__(self, n_components=3, max_iterations=100, tol=1e-5):
-        self.n_components = n_components
-        self.max_iterations = max_iterations
-        self.tol = tol
-        self.U = None
-        self.S = None
-        self.V = None
-        self.converged = False
+    X = np.asarray(X, dtype=np.float64)
 
-    def fit(self, X):
-        """Fit the OptSpace model to the observed matrix.
+    if X.ndim != 2:
+        raise ValueError(f"Input must be 2D, got {X.ndim}D array.")
 
-        Parameters
-        ----------
-        X : ndarray
-            A 2D array with observed values and NaN for missing entries.
+    m, n = X.shape
+    r = dimensions
 
-        Returns
-        -------
-        self
-            The fitted OptSpace instance.
+    if r > min(m, n):
+        raise ValueError(
+            f"dimensions ({r}) cannot exceed min matrix dimension ({min(m, n)})."
+        )
 
-        Raises
-        ------
-        ValueError
-            If input is not 2D or n_components exceeds matrix dimensions.
-        """
+    # Create observed mask (1 for observed, 0 for missing)
+    observed_mask = ~np.isnan(X)
+    n_observed = np.sum(observed_mask)
 
-        X = np.asarray(X, dtype=np.float64)
+    # Trim over-represented rows and columns
+    X_trimmed = _trim(X, observed_mask, m, n, n_observed)
 
-        if X.ndim != 2:
-            raise ValueError(f"Input must be 2D, got {X.ndim}D array.")
+    # Compute density for rescaling
+    density = n_observed / (n * m)
 
-        m, n = X.shape
-        r = self.n_components
+    # Rescale observed values for sparse initialization
+    X_trimmed /= density
 
-        if r > min(m, n):
-            raise ValueError(
-                f"n_components ({r}) cannot exceed min matrix dimension ({min(m, n)})."
-            )
+    """
+    Note:
+    The original OptSpace paper gives a method for estimating the rank
+    of a matrix, but I couldn't get this working accurately for all
+    matrices. Depending on the singular value structure of the matrix,
+    it seemed to drastically underestimate the rank in some
+    cases, which in turn gives a very inaccurate reconstruction.
+    This section seems optional, so it can safely be ignored for now.
+    """
+    """
+    # Estimate rank
+    U, s, Vt = svd(X_trimmed, full_matrices=False)
+    #U, s, Vt = svds(X_trimmed, k=min(m, n) * 0.2) # Assume rank r < 0.2 min(m,n)
+    V = Vt.T
+    U, s, V = _svd_sort(U, s, V)
 
-        # Create observed mask (1 for observed, 0 for missing)
-        observed_mask = ~np.isnan(X)
-        n_observed = np.sum(observed_mask)
+    epsilon = n_observed / np.sqrt(m * n)
+    rhat = _estimate_rank(s, epsilon)
 
-        # Trim over-represented rows and columns
-        X_trimmed = _trim(X, observed_mask, m, n, n_observed)
+    # Compute the rank-rhat projection of the trimmed matrix
+    U = U[:, :rhat]
+    V = V[:, :rhat]
+    """
 
-        # Compute density for rescaling
-        density = n_observed / (n * m)
-
-        # Rescale observed values for sparse initialization
-        X_trimmed *= density
-
-        """
-
-        # Note:
-        # The original OptSpace paper gives a method for estimating the rank
-        # of a matrix, but I couldn't get this working accurately for all
-        # matrices. Depending on the singular value structure of the matrix,
-        # it seemed to drastically underestimate the rank in some
-        # cases, which in turn gives a very inaccurate reconstruction.
-        # This section seems optional, so it can safely be ignored for now.
-
-        # Estimate rank
-        U, s, Vt = svd(X_trimmed, full_matrices=False)
-        #U, s, Vt = svds(X_trimmed, k=min(m, n) * 0.2) # Assume rank r < 0.2 min(m,n)
-        V = Vt.T
-        U, s, V = _svd_sort(U, s, V)
-
-        epsilon = n_observed / np.sqrt(m * n)
-        rhat = _estimate_rank(s, epsilon)
-
-        # Compute the rank-rhat projection of the trimmed matrix
-        U = U[:, :rhat]
-        V = V[:, :rhat]
-        """
-
-        # Initialize with truncated SVD
-        # Note that we do not need to keep S in this step, since it is immediately
-        # recomputed based on the observed entries only.
-
-        if r < min(n, m) - 1:
-            U, _, Vt = svds(X_trimmed, k=r)
+    # Initialize with truncated SVD
+    dense = True
+    try:
+        # Use sparse SVDS if possible, since typically r << min(m,n)
+        if r < min(m, n) - 1:
+            # Sparse SVDS
+            U, s, Vt = svds(X_trimmed, k=r)
             V = Vt.T
-        else:
+
+            # If SVDS succeeds, do not proceed to dense SVD
+            dense = False
+
+            # Sort unsorted singular values from SVDS
+            idx = np.argsort(s)[::-1]
+            U = U[:, idx]
+            V = Vt[idx, :].T
+    finally:
+        # SVDS may fail to converge for sparse matrices, in which
+        # case we fall back to dense SVD
+        if dense:
+            # Dense SVD
             U, _, Vt = svd(X_trimmed, full_matrices=False)
             U = U[:, :r]
             V = Vt[:r, :].T
 
-        prev_obj = np.inf
-        tol = self.tol
+    # Vectorize data matrix over observed entries
+    rows, cols = np.where(observed_mask)
+    b = X[rows, cols]
 
-        R = np.empty(n_observed)
-        S = np.empty(r**2)
-        A = np.empty((n_observed, r**2))
+    # Iteratively solve for U, V, and S by minimizing the objective
+    prev_obj = np.inf
 
-        rows, cols = np.where(observed_mask)
-        b = X[rows, cols]
+    for _ in range(max_iterations):
+        # Compute optimal S given current U, V
+        S = _solve_S(U, V, b, observed_mask, tol)
 
-        for iteration in range(self.max_iterations):
-            # Matrix A such that (USV^T)_ij = A_(i,j)(k,l) vec(S)_(k,l)
-            # A = np.einsum("ni,nj->nij", U[rows], V[cols]).reshape(n_observed, -1)
+        # Compute current error
+        R = jacobian_S(U, V, S, rows, cols) - b
 
-            """A = A.reshape(n_observed, r, r)
-            np.einsum("ni,nj->nij", U[rows], V[cols], out=A)
-            A = A.reshape(n_observed, r**2)
-            AtA = A.T @ A
-            AtAinv = np.linalg.inv(AtA)
-            s = AtAinv @ (A.T @ b)"""
+        # Current objective (Frobenius norm of error over observed entries)
+        obj = np.sum(R**2)
 
-            # Solve least-squares problem As = b
-            # s = np.linalg.solve(A.T @ A, A.T @ b)
+        # Check convergence
+        if np.abs(prev_obj - obj) < tol:
+            break
 
-            def mat_A(s):
-                As = U @ s.reshape(r, r) @ V.T
-                return As[rows, cols]
+        prev_obj = obj
 
-            def mat_A_T(w):
-                # Atw = U[rows].T @ (w[:, None] * V[cols]).reshape(-1, r)
-                # return Atw.ravel()
-                # return np.einsum('ni,nj,n->ij', U[rows], V[cols], w).ravel()
-                W = np.zeros_like(X)
-                W[observed_mask] = w
-                Atw = U.T @ W @ V
-                return Atw.ravel()
+        # Compute Gauss-Newton step
+        dU, dV = solve_gauss_newton_step(U, V, S, observed_mask, R, tol)
 
-            A_operator = LinearOperator(
-                shape=(n_observed, r**2),
-                matvec=mat_A,
-                rmatvec=mat_A_T,
-                dtype=U.dtype,
-            )
+        # Retract updates back to Grassmann manifold
+        U = retract_grassmann(U, dU)
+        V = retract_grassmann(V, dV)
 
-            result = lsmr(A_operator, b, atol=1e-5, btol=1e-5)
-            S = result[0]
-            iter = result[2]
-            print(f"S iterations: {iter}")
-            # Compute optimal S given current U, V
-            # S = _solve_S(A, U, V, b, rows, cols)
+    # Form reconstructed matrix
+    X_hat = U @ S @ V.T
 
-            # _update_residual(R, U, S, V, X)
-
-            # Compute current error
-            R = mat_A(S) - b
-
-            # Current objective (Frobenius norm of error)
-            obj = np.sum(R**2)
-            print(f"Iteration {iteration}, objective: {obj:.6f}")  # Delete
-
-            # Check convergence
-            if np.abs(prev_obj - obj) < tol:
-                self.converged = True
-                break
-
-            prev_obj = obj
-
-            # Compute Gauss-Newton step
-            dU, dV = solve_gauss_newton_step(U, V, S.reshape(r, r), observed_mask, R)
-
-            # Retract updates back to Grassmann manifold
-            U = retract_grassmann(U, dU)
-            V = retract_grassmann(V, dV)
-
-        self.X_hat = U @ S.reshape(r, r) @ V.T
-
-        return self
-
-    def transform(self, X=None):
-        """Reconstruct the complete matrix.
-
-        Parameters
-        ----------
-        X : ndarray, optional
-            Not used, present for API compatibility.
-
-        Returns
-        -------
-        ndarray
-            The reconstructed low-rank matrix.
-
-        Raises
-        ------
-        ValueError
-            If the model has not been fitted.
-        """
-
-        """
-        Note:
-        I've changed this from the original implementation.
-
-        Currently, in fit(), U and V are continually updated as mxr and nxr orthogonal
-        matrices, and S is computed as a rank 5 matrix (but NOT necessarily
-        a diagonal one).
-
-        So, we can form the reconstruction simply from USV^T. To recover a true
-        diagonal matrix S, we would have to recompute the SVD. We can safely leave
-        this to the RPCA function, since the RPCA function is essentially a wrapper
-        for OptSpace followed by SVD anyway.
-
-        OptSpace may be able to be rewritten as a function rather than a whole class,
-        but features of the Gemelli OptSpace may not be compatible with this.
-
-        Currently, though, much of this architecture is redundant outside of fit().
-        """
-
-        # if self.U is None:
-        #     raise ValueError("Model has not been fitted. Call fit() first.")
-
-        return self.X_hat  # self.U.dot(self.S).dot(self.V.T)
-
-    def fit_transform(self, X):
-        """Fit the model and return the reconstructed matrix.
-
-        Parameters
-        ----------
-        X : ndarray
-            A 2D array with observed values and NaN for missing entries.
-
-        Returns
-        -------
-        ndarray
-            The reconstructed low-rank matrix.
-        """
-        self.fit(X)
-        return self.transform()
-
-    def get_loadings(self):
-        """Get sample and feature loadings.
-
-        Returns
-        -------
-        tuple
-            (sample_loadings, feature_loadings) where sample_loadings
-            has shape (n_samples, n_components) and feature_loadings
-            has shape (n_features, n_components).
-
-        Raises
-        ------
-        ValueError
-            If the model has not been fitted.
-        """
-        if self.U is None:
-            raise ValueError("Model has not been fitted. Call fit() first.")
-
-        s = np.sqrt(np.diag(self.S))
-        sample_loadings = self.U * s
-        feature_loadings = self.V * s
-
-        return sample_loadings, feature_loadings
+    return X_hat

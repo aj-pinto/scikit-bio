@@ -180,7 +180,7 @@ from ._principal_coordinate_analysis import pcoa, pcoa_biplot
 from ._principal_component_analysis import pca
 from ._ordination_results import OrdinationResults
 from ._mmvec import mmvec, MMvec, MMvecResult
-from ._optspace import OptSpace
+from ._optspace import optspace
 from ._rpca import rpca
 from ._utils import (
     mean_and_std,
