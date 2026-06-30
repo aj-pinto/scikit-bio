@@ -69,7 +69,7 @@ Ordination results
    :toctree:
 
    OrdinationResults
-   OptSpace
+   optspace
 
 
 Utility functions

@@ -103,14 +103,14 @@ def _solve_S(U, V, b, observed_mask, tol):
     def rmatvec(w):
         return jacobian_S_adj(U, V, w, observed_mask)
 
-    jacobian_S = LinearOperator(
+    J_S = LinearOperator(
         shape=(n_observed, r**2),
         matvec=matvec,
         rmatvec=rmatvec,
         dtype=U.dtype,
     )
 
-    s = lsmr(jacobian_S, b, atol=tol, btol=tol)[0]
+    s = lsmr(J_S, b, atol=tol, btol=tol)[0]
 
     return s.reshape(r, r)
 
@@ -236,14 +236,14 @@ def solve_gauss_newton_step(U, V, S, observed_mask, R, tol):
         dU, dV = jacobian_UV_adj(U, V, S, y, observed_mask)
         return pack(dU, dV)
 
-    J = LinearOperator(
+    J_UV = LinearOperator(
         shape=(np.sum(observed_mask), nvars),
         matvec=matvec,
         rmatvec=rmatvec,
         dtype=U.dtype,
     )
 
-    step = lsmr(J, -R.ravel(), atol=tol, btol=tol)[0]
+    step = lsmr(J_UV, -R.ravel(), atol=tol, btol=tol)[0]
 
     return unpack(step, U.shape, V.shape)
 
@@ -304,18 +304,20 @@ def optspace(X, dimensions=3, max_iterations=20, tol=1e-5):
     Examples
     --------
     >>> import numpy as np
-    >>> from skbio.stats.ordination import OptSpace
-    >>> # Create a low-rank matrix with missing entries
-    >>> np.random.seed(42)
-    >>> true_U = np.random.randn(10, 2)
-    >>> true_V = np.random.randn(8, 2)
-    >>> true_M = true_U.dot(true_V.T)
+    >>> from skbio.stats.ordination import optspace
+    >>> # Create a low-rank matrix
+    >>> m, n, r = 600, 600, 5
+    >>> rng = np.random.default_rng(0)
+    >>> U_true = rng.normal(size=(m,r))
+    >>> V_true = rng.normal(size=(n,r))
+    >>> M_true = U_true @ V_true.T
     >>> # Mask some entries
-    >>> M_observed = true_M.copy()
-    >>> M_observed[::2, ::2] = np.nan  # Hide some entries
+    >>> M_obs = M_true.copy()
+    >>> p_observe = 0.4  # 40% observed
+    >>> mask = rng.random((m, n)) < p_observe
+    >>> M_obs[~mask] = np.nan
     >>> # Recover the matrix
-    >>> opt = OptSpace(dimensions=2, max_iterations=10)
-    >>> M_recovered = opt.fit_transform(M_observed)
+    >>> M_hat = optspace(M_obs, dimensions=r)
     """
 
     X = np.asarray(X, dtype=np.float64)
