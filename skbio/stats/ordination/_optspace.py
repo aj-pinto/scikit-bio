@@ -254,7 +254,7 @@ def retract_grassmann(X, dX):
     return Q[:, : X.shape[1]]
 
 
-def optspace(X, dimensions=3, max_iterations=20, tol=1e-5):
+def optspace(X, dimensions=3, max_iter=20, tol=1e-5):
     r"""Matrix completion using the OptSpace algorithm.
 
     OptSpace is an algorithm for recovering a low-rank matrix from a
@@ -267,7 +267,7 @@ def optspace(X, dimensions=3, max_iterations=20, tol=1e-5):
         A 2D array with observed values and NaN for missing entries.
     dimensions : int, optional
         The rank of the matrix to recover. Default is 3.
-    max_iterations : int, optional
+    max_iter : int, optional
         Maximum number of iterations. Default is 20.
     tol : float, optional
         Convergence tolerance. Default is 1e-5.
@@ -402,7 +402,7 @@ def optspace(X, dimensions=3, max_iterations=20, tol=1e-5):
     # Iteratively solve for U, V, and S by minimizing the objective
     prev_obj = np.inf
 
-    for _ in range(max_iterations):
+    for _ in range(max_iter):
         # Compute optimal S given current U, V
         S = _solve_S(U, V, b, observed_mask, tol)
 

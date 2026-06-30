@@ -141,13 +141,6 @@ def rpca(
     # Ingestion of input data matrix
     X, row_ids, column_ids = _ingest_table(X, sample_ids, feature_ids)
 
-    # Why 3 samples?
-    # \/\/\/\/
-    if X.shape[0] < 3:
-        raise ValueError(
-            f"Table has only {X.shape[0]} samples. At least 3 samples are required."
-        )
-
     if X.shape[1] < dimensions:
         raise ValueError(
             f"Table has only {X.shape[1]} features. "
@@ -155,12 +148,10 @@ def rpca(
         )
 
     # Apply OptSpace for matrix completion
-    optspace = OptSpace(n_components=dimensions, max_iterations=max_iter)
-    optspace.fit(X)
-    X = optspace.transform()
+    X = optspace(X, dimensions=dimensions, max_iter=max_iter)
 
     # Perform PCA on the completed matrix
-    output = _pca(X, method="svd", dimensions=dimensions)
+    output = _pca(X, method="svds", dimensions=dimensions)
 
     # Build the OrdinationResults object
     pc_ids = ["%s%d" % ("PC", i + 1) for i in range(output["variances"].shape[0])]
